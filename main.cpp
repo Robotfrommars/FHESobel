@@ -1,95 +1,138 @@
-#include <helib/helib.h>
-#include <chrono>
-#include <iomanip>
-#include <iostream>
-#include <sstream>
-#include <string>
-#include <vector>
-using namespace std;
-using namespace helib;
+#include "net.h"
 #include <opencv2/opencv.hpp>
-//Useful functions
-//taken from demo code
+#include <cmath>
+#include <iostream>
+using namespace helib;
+using namespace std;
+using namespace cv;
+void encryptRow(const PubKey& pk, const Context& ctx, const cv::Mat& img,int y, long nslots, Ctxt& out) {
+  //default row of 255 so we can do top and bottom rows
+  vector<long> vals(nslots, 255);
+  //check if top or bottom row, 
+  if (y >= 0 && y < img.rows)
+    //go through rows and update vector with actual values
+    for (int x = 0; x < img.cols; ++x) 
+      vals[x] = img.at<uchar>(y, x);
+  //create plaintext of row
+  Ptxt<BGV> pt(ctx, vals);
+  //encrypt the row and store in out
+  pk.Encrypt(out, pt);
+}
+//helper function taken from demo for time
 using Clock = chrono::steady_clock;
 double msSince(Clock::time_point t0)
 {
-  return chrono::duration<double, milli>(Clock::now() - t0).count();
+return chrono::duration<double, milli>(Clock::now() - t0).count();
 }
-//client side code
-int clientSide(const string& filename, long m, long p, long bits)
-{
-//Use opencv to get the image in greyscale
-    cv::Mat img = cv::imread(filename, cv::IMREAD_GRAYSCALE);  // loads directly as grayscale
-    if (img.empty()) {
-        std::cerr << "Could not open image: " << filename << "\n";
-        return 1;
-    }
-//get pixel width of image for helib usage
-    int width=img.cols;
-    int height=img.rows;
-
-    //debug cout<<width;
-//set up context
-    Context ctx = ContextBuilder<BGV>().m(m).p(p).r(1).bits(bits).c(2).build();
-    long nslots = ctx.getEA().size();
-    std::cout << "slots: " << nslots << "\n";
-
-  //convert image to a usable scale for Helib
-    // int side = (int)std::floor(std::sqrt((double)nslots));
-    // if (img.rows * img.cols > nslots)
-    // cv::resize(img, img, cv::Size(side, side), 0, 0, cv::INTER_AREA);
-
-  // Keys
-    helib::SecKey sk(ctx);
-    sk.GenSecKey();
-    const helib::PubKey& pk = sk;
-
-  // Get ready to encrypt and send over to server
-    helib::Ptxt<helib::BGV> ptxt(ctx);   
-    for (int r = 0; r < img.rows; ++r)
-        for (int c = 0; c < img.cols; ++c)
-            ptxt[r * img.cols + c] = img.at<uchar>(r, c);
-
-  // Encrypt data
-    auto t0 = Clock::now();
-    helib::Ctxt ctxt(pk);
-    pk.Encrypt(ctxt, ptxt);
-    double tEnc = msSince(t0);
-
-  
-//call server function with encrypted data and width as variable
-    auto t1 = Clock::now();
-//await server
-    double tServ = msSince(t1);
-//print wait time
-//convert back to an image and save image
-    auto t2 = Clock::now();
-    helib::Ptxt<helib::BGV> out(ctx);
-    sk.Decrypt(out, ctxt);
-    double tDec = msSince(t2);
-    cv::Mat rec(img.rows, img.cols, CV_8UC1);   
-    for (int r = 0; r < img.rows; ++r) {
-        for (int c = 0; c < img.cols; ++c) {
-            NTL::ZZX poly = out[r * img.cols + c].getData();   // PolyMod -> ZZX
-            long v = NTL::conv<long>(NTL::coeff(poly, 0));     // constant term = the pixel
-            rec.at<uchar>(r, c) = static_cast<uchar>(v);
-        }
-    }
-    if (!cv::imwrite("output.jpg", rec)) {
-        std::cerr << "Error: Failed to save the image." << std::endl;
-        return -1;
-    }
-//clean-up as needed
-    cout << "Time to encrypt: "<<tEnc<<endl<<"Time for server: "<<tServ<<endl<<"Time to decrypt: "<<tDec<<endl;
+int main(int argc, char* argv[]) {
+  //read in image
+  auto t = Clock::now(); //used for total runtime
+  cv::Mat img;
+  double tEnc=0, tDec=0,tServ=0;
+  int m,p,bits;
+  if(argc < 2) //default to mandrill image
+  {img = cv::imread("mandril_256x256.jpg", cv::IMREAD_GRAYSCALE);
+  if (img.empty()) { std::cerr << "load failed\n"; return 1; }
+    m=16384;
+    p=65537;
+    bits=200;
+  }
+  else if(argc == 2){ //file given
+    img = cv::imread(argv[1], cv::IMREAD_GRAYSCALE);
+    if (img.empty()) { std::cerr << "load failed\n"; return 1; }
+    m=16384;
+    p=65537;
+    bits=200;
+  }
+  else{
+    cerr<<"Invalid call";
     return 1;
-}
-int main(int argc, char* argv[])
-{
-  //call client side code
-  if (argc != 2) {
-       cerr << "usage: " << argv[0] << " <image path>\n";
-       return 1;
+  }
+  //setup context p>256*256
+  Context context = ContextBuilder<BGV>().m(m).p(p).r(2).bits(bits).c(2).build();
+  //nslots for usage (Lots of issues with this when try one ciphertext for the entire image)
+  long nslots = context.getEA().size();
+  //create private key
+  SecKey sk(context);
+  sk.GenSecKey();
+  //create public key
+  addSome1DMatrices(sk);                 
+  const PubKey& pk = sk;
+
+  // Connect
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+  addr.sin_port = htons(5555);
+  if (connect(fd, (sockaddr*)&addr, sizeof addr) < 0) {
+    cerr << "connect failed (is the server running?)\n";
+    return 1;
+  }
+
+  // Send context so server can initialize the same context
+  stringstream ss1; context.writeTo(ss1); sendBlob(fd, ss1.str()); 
+  //send public key for server usage
+  stringstream ss2; pk.writeTo(ss2);      sendBlob(fd, ss2.str()); 
+  uint64_t numMsgs = img.rows + 2;
+  writeAll(fd, &numMsgs, sizeof numMsgs);
+
+  // 2. Stream rows, read results as they come back
+  cv::Mat mag(img.rows, img.cols, CV_8UC1);
+  Ctxt row(pk);
+  //send blank row of zeroes for row above image
+  auto t0 = Clock::now();
+  encryptRow(pk, context, img, -1, nslots, row);
+  tEnc += msSince(t0);
+  sendCtxt(fd, row);
+  //send row i=0
+  t0 = Clock::now();
+  encryptRow(pk, context, img,  0, nslots, row); 
+  tEnc += msSince(t0);
+  sendCtxt(fd, row);
+
+  for (int y = 0; y < img.rows; ++y) {
+    //encrypt row below and send
+    auto t0 = Clock::now();
+    encryptRow(pk, context, img, y + 1, nslots, row);
+    tEnc += msSince(t0);
+
+    //send row to server
+    auto t1 = Clock::now();
+    sendCtxt(fd, row);
+
+    //get response back from server for row i/y
+    Ctxt res = recvCtxt(fd, pk);
+    tServ += msSince(t1); //time since sending context to server (increment to total over the entire runtime)
+    //mimic how the server sent data the data, not the best way of doing this
+    res.writeTo(ss1);
+  
+    
+    //setup a plaintext to store the decrypted text
+    Ptxt<BGV> out(context);
+    //decrypt plain and simple
+    auto t2 = Clock::now();
+  
+    sk.Decrypt(out, res);
+    tDec += msSince(t2); //increment total decrypt time since each row is handled separately
+
+
+    //convert row back into image and store row in output image mag
+    for (int x = 0; x < img.cols; ++x) {
+      long g2 = NTL::conv<long>(NTL::coeff(out[x].getData(), 0));
+      mag.at<uchar>(y, x) = (uchar)std::min(255.0, std::sqrt((double)g2));
     }
-    string filename=argv[1];
-    return clientSide(filename,32768,65537,500);
+    if(y%15==0) //less output to console 255%15=0
+    std::cout << "row " << y << " done\n";
+  }
+  
+  cv::imwrite("sobel_encrypted.jpg", mag);
+  close(fd);
+  double tTot = msSince(t);
+  cout<< "Total runtime: "<<tTot<<endl;
+  cout<< "Server runtime: "<<tServ<<endl;
+  cout<< "Encryption runtime: "<<tEnc<<endl;
+  cout<< "Decrytion runtime: "<<tDec<<endl;
+  cout << "Sent "<< bytesSent << " bytes to the Server.\n";
+  cout << "Received "<< bytesRecv << " bytes from the Server.\n";
 }
