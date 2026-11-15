@@ -105,7 +105,7 @@ int main(int argc, char* argv[]) {
     Ctxt res = recvCtxt(fd, pk);
     tServ += msSince(t1); //time since sending context to server (increment to total over the entire runtime)
     //mimic how the server sent data the data, not the best way of doing this
-    res.writeTo(ss1);
+    //res.writeTo(ss1);
   
     
     //setup a plaintext to store the decrypted text
